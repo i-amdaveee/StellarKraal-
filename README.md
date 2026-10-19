@@ -66,3 +66,8 @@ Borrower            Contract                 Lender / Listener
 ```
 
 If the borrower does not repay before the due date, the lender calls `mark_default`, which emits `loan_defaulted` and moves the loan to the terminal `Defaulted` state.
+
+## Handsoff notes
+
+<!-- handsoff-issue-1393 -->
+- #1393: Add confirmation dialogs for destructive and high-stakes actions
