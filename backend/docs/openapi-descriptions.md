@@ -4,6 +4,36 @@ This document provides a human-readable reference for all endpoints defined in
 `openapi.json`. It mirrors the descriptions in the spec and is intended for
 quick navigation during development and code review.
 
+## API Versioning
+
+All endpoints are served under a versioned base path. The current stable
+version is **`/api/v1`**, which is the `servers[].url` base path declared in
+`openapi.json`. Every path listed below is relative to that base path — e.g.
+the health check is reachable at `/api/v1/health`.
+
+### Version router pattern
+
+Routes are mounted through a version router so that new versions can be added
+independently without touching existing handlers:
+
+```
+/api/v1  ->  v1 router  (all routes in this document)
+/api/v2  ->  v2 router  (added independently during a migration period)
+```
+
+To introduce `/api/v2`, add a new version router and mount it alongside `v1`;
+both versions coexist during the migration window. Existing clients keep using
+`/api/v1` unchanged.
+
+### Unversioned requests
+
+Requests to `/api` (without a version segment) are **not** routed to any
+handler. They return `404` with a message pointing to the versioned path, e.g.:
+
+```json
+{ "error": "API version required. Use /api/v1/...", "code": "API_VERSION_REQUIRED" }
+```
+
 ## Authentication (`auth`)
 
 | Method | Path | Summary |
@@ -36,6 +66,26 @@ quick navigation during development and code review.
 | DELETE | `/collateral/{id}` | Soft-delete a collateral record |
 | PATCH | `/collateral/{id}/restore` | Restore soft-deleted collateral |
 
+### `PATCH /collateral/{id}` — Partial update
+
+Partially updates a collateral record. Only the owner of the collateral or an
+admin may patch it; other callers receive `403 Forbidden`.
+
+**Patchable fields** (all optional, at least one required):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `weight` | number | Changing this queues a new appraisal |
+| `healthStatus` | string | Changing this queues a new appraisal |
+| `notes` | string | Free-form health notes; does not affect appraisal |
+
+**Behaviour**
+
+- Returns `400 Bad Request` when the request body contains no patchable fields.
+- When `weight` or `healthStatus` changes, a new appraisal is queued for the
+  collateral record.
+- Returns the updated collateral record on success.
+
 ## Loans (`loan`)
 
 | Method | Path | Summary |
@@ -48,6 +98,17 @@ quick navigation during development and code review.
 | DELETE | `/loan/{id}` | Soft-delete a loan record |
 | GET | `/loans` | List loans (paginated) |
 | GET | `/loans/summary` | Get borrower loan portfolio summary |
+
+### Idempotency (`Idempotency-Key`)
+
+`POST /loan/repay` (and the versioned alias `POST /api/v1/loans/{id}/repay`)
+accepts an optional `Idempotency-Key` request header. When supplied, the server
+records the response for that key and replays it on any subsequent request that
+reuses the same key, preventing duplicate repayments caused by network retries.
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Idempotency-Key` | No | Client-generated unique key (e.g. a UUID). Reusing a key returns the cached response (original status code) instead of creating a new repayment. Keys expire after 24 hours. |
 
 ## Oracle (`oracle`)
 
@@ -105,90 +166,138 @@ client SDK generation.
 
 ### Documentation Source of Truth
 
-- **OpenAPI spec**: [`openapi.json`](../openapi.json)
+- **OpenAPI spec**: [`openapi.json`](../openapi.json) — `servers[].url` is
+  `/api/v1`, so all paths are versioned under that base path.
 - **Swagger UI**: available at the server root when `NODE_ENV !== 'production'`
 - **This file**: mirrors the spec for quick reference; always validate against
   the canonical `openapi.json`.
 
 ---
 
-## Loan State Machine & On-Chain Event Mapping
+## Liquidation Mechanism
 
-The loan lifecycle is driven by the Soroban loan contract. Every state
-transition emits exactly one contract event; off-chain listeners should treat
-the event stream as the authoritative source of truth and reconcile the DB
-record against it.
+This section documents how liquidation works for undercollateralised loans,
+including worked numeric examples for **partial liquidation** scenarios.
 
-### States
-
-| State | Description | Entry conditions | Exit conditions |
-|-------|-------------|------------------|-----------------|
-| `Requested` | Borrower has submitted a loan request; awaiting review/approval. | `request_loan` succeeds (collateral registered & appraised). | Approved → `Approved`; rejected/cancelled → `Cancelled`; expired → `Expired`. |
-| `Approved` | Loan approved and funds reserved; awaiting disbursement. | `approve_loan` succeeds on a `Requested` loan. | Disbursed → `Active`; cancelled → `Cancelled`; expired → `Expired`. |
-| `Active` | Principal disbursed; borrower owes repayment. | `disburse_loan` succeeds on an `Approved` loan. | Fully repaid → `Repaid`; overdue → `Defaulted`; liquidated → `Liquidated`. |
-| `Repaid` | Loan fully repaid (terminal). | `repay_loan` covers outstanding principal + interest. | — (terminal) |
-| `Defaulted` | Loan past due and not repaid (terminal unless liquidated). | Grace period elapses while `Active` and unpaid. | Liquidated → `Liquidated`. |
-| `Liquidated` | Collateral seized to cover the debt (terminal). | `liquidate_loan` succeeds on `Active`/`Defaulted` undercollateralised loan. | — (terminal) |
-| `Cancelled` | Loan cancelled before disbursement (terminal). | `cancel_loan` on `Requested`/`Approved`. | — (terminal) |
-| `Expired` | Approval/request expired before next step (terminal). | Expiry timestamp passes in `Requested`/`Approved`. | — (terminal) |
-
-### Transition → Event Mapping
-
-| From | To | Contract event | Payload |
-|------|----|----------------|---------|
-| — | `Requested` | `loan_requested` | `{ loan_id, borrower, collateral_id, principal, interest_rate, due_at }` |
-| `Requested` | `Approved` | `loan_approved` | `{ loan_id, approver, approved_at }` |
-| `Approved` | `Active` | `loan_disbursed` | `{ loan_id, borrower, amount, disbursed_at }` |
-| `Active` | `Repaid` | `loan_repaid` | `{ loan_id, payer, amount, remaining, repaid_at }` |
-| `Active` | `Defaulted` | `loan_defaulted` | `{ loan_id, borrower, overdue_since }` |
-| `Active`/`Defaulted` | `Liquidated` | `loan_liquidated` | `{ loan_id, liquidator, collateral_id, proceeds, liquidated_at }` |
-| `Requested`/`Approved` | `Cancelled` | `loan_cancelled` | `{ loan_id, cancelled_by, reason }` |
-| `Requested`/`Approved` | `Expired` | `loan_expired` | `{ loan_id, expired_at }` |
-
-All events are emitted with topics `("loan", <event_name>, loan_id)` so
-listeners can filter by loan. Amounts are in stroops (i128).
-
-### Invalid Transitions & Errors
-
-Attempting a transition that is not permitted for the current state reverts
-the transaction and returns a contract error (surfaced by the API as a
-`409 Conflict` with the corresponding `code`).
-
-| Attempted transition | Current state | Contract error | API `code` |
-|----------------------|---------------|----------------|------------|
-| `approve_loan` | not `Requested` | `InvalidState` | `LOAN_INVALID_STATE` |
-| `disburse_loan` | not `Approved` | `InvalidState` | `LOAN_INVALID_STATE` |
-| `repay_loan` | not `Active` | `InvalidState` | `LOAN_INVALID_STATE` |
-| `liquidate_loan` | not `Active`/`Defaulted` | `InvalidState` | `LOAN_INVALID_STATE` |
-| `cancel_loan` | not `Requested`/`Approved` | `InvalidState` | `LOAN_INVALID_STATE` |
-| any transition | terminal state | `TerminalState` | `LOAN_TERMINAL_STATE` |
-| `repay_loan` | `Active`, amount < owed | `InsufficientRepayment` | `LOAN_INSUFFICIENT_REPAYMENT` |
-| `liquidate_loan` | `Active`, health factor ≥ 1 | `NotLiquidatable` | `LOAN_NOT_LIQUIDATABLE` |
-
-### Lifecycle Timing Diagram
+### Health Factor Formula
 
 ```
-borrower        contract                 listener (off-chain)
-   |               |                          |
-   | request_loan  |                          |
-   |-------------->|                          |
-   |               | emit loan_requested      |
-   |               |------------------------->|  state: Requested
-   |               |                          |
-   |               | approve_loan             |
-   |               | emit loan_approved       |
-   |               |------------------------->|  state: Approved
-   |               |                          |
-   |               | disburse_loan            |
-   |               | emit loan_disbursed      |
-   |               |------------------------->|  state: Active
-   |               |                          |
-   | repay_loan    |                          |
-   |-------------->|                          |
-   |               | emit loan_repaid         |
-   |               |------------------------->|  state: Repaid (terminal)
+healthFactor = (collateralValue × liquidationThreshold) / outstandingDebt
 ```
 
-Alternate branches from `Active`: `loan_defaulted` (→ `Defaulted`) followed by
-`loan_liquidated` (→ `Liquidated`), or `loan_cancelled`/`loan_expired` from
-`Requested`/`Approved`.
+- `collateralValue` — current appraised value of the loan's collateral.
+- `liquidationThreshold` — the fraction of collateral value counted toward
+  coverage (e.g. `0.80`).
+- `outstandingDebt` — principal + accrued interest still owed.
+
+A loan is **liquidatable** when `healthFactor < 1.0`. A loan is **safe** when
+`healthFactor >= 1.0`.
+
+### Partial Liquidation
+
+A partial liquidation repays only a portion of the outstanding debt in exchange
+for a proportional slice of collateral plus a liquidation bonus. The protocol
+caps how much debt a single liquidation may clear (`maxLiquidationRatio`, e.g.
+`0.50` = up to 50% of outstanding debt per call) so that borrowers retain
+collateral when possible.
+
+**Liquidation bonus** — liquidators are compensated for taking on risk and
+providing immediate liquidity. The bonus is a percentage of the debt repaid
+(`liquidationBonus`, e.g. `0.05` = 5%) and is **distributed as additional
+collateral** seized by the liquidator:
+
+```
+collateralSeized = debtRepaid × (1 + liquidationBonus)
+```
+
+The bonus is not minted or paid in cash — it is taken from the borrower's
+collateral pool. The borrower's remaining collateral is reduced by
+`collateralSeized`, and their outstanding debt is reduced by `debtRepaid`.
+
+### Worked Examples
+
+All examples assume `liquidationThreshold = 0.80`, `liquidationBonus = 0.05`,
+and `maxLiquidationRatio = 0.50`.
+
+#### Example 1 — Small partial liquidation
+
+| Field | Value |
+|-------|-------|
+| Collateral value | 10,000 |
+| Outstanding debt | 9,000 |
+| Health factor | (10,000 × 0.80) / 9,000 = **0.889** (liquidatable) |
+
+A liquidator repays **2,000** of debt:
+
+- `collateralSeized = 2,000 × 1.05 = 2,100`
+- New collateral value = 10,000 − 2,100 = **7,900**
+- New outstanding debt = 9,000 − 2,000 = **7,000**
+- New health factor = (7,900 × 0.80) / 7,000 = **0.903**
+
+The loan remains liquidatable (still `< 1.0`), so further partial liquidations
+are permitted.
+
+#### Example 2 — Partial liquidation that restores health
+
+| Field | Value |
+|-------|-------|
+| Collateral value | 12,000 |
+| Outstanding debt | 10,000 |
+| Health factor | (12,000 × 0.80) / 10,000 = **0.96** (liquidatable) |
+
+A liquidator repays the maximum allowed (`10,000 × 0.50 = 5,000`):
+
+- `collateralSeized = 5,000 × 1.05 = 5,250`
+- New collateral value = 12,000 − 5,250 = **6,750**
+- New outstanding debt = 10,000 − 5,000 = **5,000**
+- New health factor = (6,750 × 0.80) / 5,000 = **1.08**
+
+The loan is now healthy (`>= 1.0`) and cannot be re-liquidated until the health
+factor drops below `1.0` again.
+
+#### Example 3 — Capped partial liquidation (still unhealthy)
+
+| Field | Value |
+|-------|-------|
+| Collateral value | 8,000 |
+| Outstanding debt | 9,000 |
+| Health factor | (8,000 × 0.80) / 9,000 = **0.711** (deeply liquidatable) |
+
+A liquidator repays the maximum allowed (`9,000 × 0.50 = 4,500`):
+
+- `collateralSeized = 4,500 × 1.05 = 4,725`
+- New collateral value = 8,000 − 4,725 = **3,275**
+- New outstanding debt = 9,000 − 4,500 = **4,500**
+- New health factor = (3,275 × 0.80) / 4,500 = **0.582**
+
+Because the per-call cap was hit, the loan is still liquidatable. A second
+liquidation call may clear up to `4,500 × 0.50 = 2,250` more debt.
+
+### Minimum Health Factor to Avoid Re-Liquidation
+
+After a partial liquidation, the loan is only protected from further
+liquidation once its health factor is **`>= 1.0`**. There is no separate
+"buffer" threshold: any health factor below `1.0` leaves the loan open to
+another liquidation call. Liquidators should size their repayment so the
+resulting health factor reaches at least `1.0` (see Example 2); if the per-call
+cap prevents this, multiple sequential calls are required.
+
+### Liquidator's Guide
+
+1. **Find liquidatable loans.** Poll `GET /health/{loanId}` (or scan
+   `GET /loans`) for loans whose `healthFactor < 1.0`.
+2. **Size the repayment.** Choose `debtRepaid` up to
+   `outstandingDebt × maxLiquidationRatio`. To fully restore health, solve for
+   the repayment that brings the post-liquidation health factor to `>= 1.0`.
+3. **Preview the outcome.** Use `POST /loan/repayment-preview` to confirm the
+   debt/collateral split before committing.
+4. **Trigger the liquidation.** Call `POST /loan/liquidate` with the loan ID and
+   the chosen `debtRepaid` amount. The endpoint repays the debt, seizes
+   `debtRepaid × (1 + liquidationBonus)` of collateral, and records the
+   transaction.
+5. **Profit.** The liquidator's gain is the bonus portion of the seized
+   collateral: `debtRepaid × liquidationBonus`. In Example 1, repaying `2,000`
+   seizes `2,100` of collateral — a `100` bonus (5%). The liquidator may hold or
+   sell the seized collateral to realise the profit.
+6. **Verify.** Confirm the resulting health factor via `GET /health/{loanId}`
+   and the recorded transaction via `GET /transactions/{hash}/status`.
